@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,6 +78,7 @@ class FlashSelfAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
         self.triton = triton
+        self.sparse_tp_comm = os.getenv("DEJAVU_SPARSE_TP_COMM", "0") == "1"
 
     def forward(self, qkv, causal=None, cu_seqlens=None, max_seqlen=None):
         """Implements the multihead softmax attention.
@@ -1060,6 +1061,7 @@ class ParallelMHADejavu(nn.Module):
         out = self.out_proj(context)
         curr_stream.record_event(self.event_out)
 
+        
         out = all_reduce(out, self.process_group)
 
         mlp_idx = None

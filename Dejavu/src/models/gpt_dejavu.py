@@ -312,6 +312,11 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             if process_group is not None
             else {}
         )
+        
+        ffn_kwargs = {
+            "use_flashffn": getattr(config, "use_flashffn", False),
+            "use_sparse_tp_comm": getattr(config, "use_sparse_tp_comm", False)
+        }
 
         mlp_cls = partial(
             mlp_cls,
@@ -322,6 +327,7 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             layer_idx=layer_idx,
             **parallel_kwargs,
             **factory_kwargs,
+            **ffn_kwargs
         )
 
     else:

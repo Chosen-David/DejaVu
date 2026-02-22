@@ -824,6 +824,7 @@ class ParallelFusedMLPDejavu(nn.Module):
         in_features,
         hidden_features,
         sp_kwargs,
+        ffn_kwargs,
         out_features=None,
         activation="gelu_approx",
         layer_idx=None,
@@ -856,6 +857,7 @@ class ParallelFusedMLPDejavu(nn.Module):
         assert activation in ["gelu_approx", "relu"]
         assert process_group is not None
         assert sp_kwargs != None, "sparse predictor parameters are not passed in."
+        assert ffn_kwargs != None, "FlashFFN not passed in."
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         if out_features is None:
@@ -885,6 +887,8 @@ class ParallelFusedMLPDejavu(nn.Module):
         self.sp_stream = torch.cuda.Stream(device="cuda", priority=0)
         self.event_mlp = torch.cuda.Event(enable_timing=False, blocking=False)
         self.event_mlp_sp = torch.cuda.Event(enable_timing=False, blocking=False)
+        self.use_flashffn = ffn_kwargs.get("use_flashffn", False)
+        self.use_sparse_tp_comm = ffn_kwargs.get("use_sparse_tp_comm", False)
 
     def forward(self, x, residual, idx=None):
         if self.heuristic == "auto":
@@ -905,21 +909,26 @@ class ParallelFusedMLPDejavu(nn.Module):
         curr_stream = torch.cuda.current_stream()
         do_token_generation = x.size(1) == 1
         if idx != None:
-            assert x.size(1) == 1
-            from einops import rearrange
-            from src.ops.triton.gather_gemv import mlp_sparse
+            if self.use_flashffn:
+                sorver(id)
+                flashffn(idx, x, self.fc1, self.fc2, plan) # 直接算完整个FFN
+                
+            else: 
+                assert x.size(1) == 1
+                from einops import rearrange
+                from src.ops.triton.gather_gemv import mlp_sparse
 
-            if self.fc2_weight_t is None:
-                self.fc2_weight_t = self.fc2.weight.t().contiguous()
-            out = mlp_sparse(
-                rearrange(x, "b 1 d -> b d"),
-                self.fc1.weight,
-                self.fc2_weight_t,
-                idx,
-                self.fc1.bias,
-                self.fc2.bias,
-            )
-            out = rearrange(out, "b d -> b 1 d")
+                if self.fc2_weight_t is None:
+                    self.fc2_weight_t = self.fc2.weight.t().contiguous()
+                out = mlp_sparse(
+                    rearrange(x, "b 1 d -> b d"),
+                    self.fc1.weight,
+                    self.fc2_weight_t,
+                    idx,
+                    self.fc1.bias,
+                    self.fc2.bias,
+                )
+                out = rearrange(out, "b d -> b 1 d")
         else:
             out = fused_mlp_func(
                 x,
@@ -936,8 +945,10 @@ class ParallelFusedMLPDejavu(nn.Module):
             )
         curr_stream.record_event(self.event_mlp)
         reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
-
-        out = reduce_fn(out, self.process_group)
+        if self.use_sparse_tp_comm:
+            out = sparse_tp_comm(xxxxx)
+        else:
+            out = reduce_fn(out, self.process_group)
 
         with torch.cuda.stream(self.sp_stream):
             self.sp_stream.wait_event(self.event_mlp)

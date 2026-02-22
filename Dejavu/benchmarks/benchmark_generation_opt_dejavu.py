@@ -98,7 +98,13 @@ if args.att_K1 < config.n_head or args.att_K2 < config.n_head:
     config.att_sparse = True
     config.att_K = [args.att_K1, args.att_K2]
     config.att_sp_dim = 512
-
+    
+'''
+sa-flash ffn config
+'''
+config.use_flashffn = True
+config.use_sparse_tp_comm = True
+  
 assert config.att_sparse and config.mlp_sparse == True
 
 from apex.transformer import parallel_state
