@@ -15,6 +15,61 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import time
+import tempfile
+
+
+def _json_safe(value):
+    """Convert numpy scalar/list values to standard JSON-serializable Python types."""
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
+
+
+def _atomic_save_json(path: Path, payload: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _atomic_save_npy(path: Path, array: np.ndarray):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp.npy",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            np.save(f, array)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 @dataclass
@@ -27,13 +82,13 @@ class PartitionResult:
     lans_count: int
     
     def to_dict(self) -> Dict:
-        return {
+        return _json_safe({
             'gpu_id': self.gpu_id,
             'hans_indices': self.hans_indices,
             'lans_indices': self.lans_indices,
             'hans_count': self.hans_count,
             'lans_count': self.lans_count,
-        }
+        })
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'PartitionResult':
@@ -57,14 +112,14 @@ class TCCCAssignmentResult:
     overlap_efficiency: float
     
     def to_dict(self) -> Dict:
-        return {
+        return _json_safe({
             'gpu_id': self.gpu_id,
             'tc_indices': self.tc_indices,
             'cc_indices': self.cc_indices,
             'tc_time_ms': self.tc_time_ms,
             'cc_time_ms': self.cc_time_ms,
             'overlap_efficiency': self.overlap_efficiency,
-        }
+        })
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'TCCCAssignmentResult':
@@ -111,7 +166,7 @@ class AnalysisResult:
     activation_frequencies_path: Optional[str] = None
     
     def to_dict(self) -> Dict:
-        return {
+        return _json_safe({
             'layer_id': self.layer_id,
             'model_name': self.model_name,
             'timestamp': self.timestamp,
@@ -127,7 +182,7 @@ class AnalysisResult:
             'analysis_time_s': self.analysis_time_s,
             'coactivation_matrix_path': self.coactivation_matrix_path,
             'activation_frequencies_path': self.activation_frequencies_path,
-        }
+        })
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'AnalysisResult':
@@ -192,8 +247,7 @@ class AnalysisResultStore:
     
     def _save_index(self):
         """Save global index."""
-        with open(self.index_path, 'w') as f:
-            json.dump(self.index, f, indent=2)
+        _atomic_save_json(self.index_path, self.index)
     
     def save_result(
         self,
@@ -220,19 +274,18 @@ class AnalysisResultStore:
         # Save co-activation matrix
         if coactivation_matrix is not None:
             cw_path = layer_dir / "coactivation_matrix.npy"
-            np.save(cw_path, coactivation_matrix)
+            _atomic_save_npy(cw_path, coactivation_matrix)
             result.coactivation_matrix_path = str(cw_path)
         
         # Save activation frequencies
         if activation_frequencies is not None:
             freq_path = layer_dir / "activation_frequencies.npy"
-            np.save(freq_path, activation_frequencies)
+            _atomic_save_npy(freq_path, activation_frequencies)
             result.activation_frequencies_path = str(freq_path)
         
         # Save result metadata
         result_path = layer_dir / "result.json"
-        with open(result_path, 'w') as f:
-            json.dump(result.to_dict(), f, indent=2)
+        _atomic_save_json(result_path, result.to_dict())
         
         # Update index
         if result.model_name not in self.index['models']:

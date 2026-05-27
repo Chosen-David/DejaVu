@@ -13,7 +13,7 @@ Key features:
 
 import torch
 import torch.distributed as dist
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 from dataclasses import dataclass
 
@@ -120,7 +120,7 @@ class SparseAllReducer:
         tensor: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         async_op: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
+    ) -> Tuple[torch.Tensor, Optional[Any]]:
         """
         Perform sparse AllReduce on a tensor.
         
@@ -173,7 +173,7 @@ class SparseAllReducer:
         self,
         sparse_tensor: SparseTensor,
         async_op: bool,
-    ) -> Optional[dist.Work]:
+    ) -> Optional[Any]:
         """
         Implementation of sparse AllReduce.
         
@@ -253,7 +253,7 @@ class SparseAllReducer:
         self,
         tensor: torch.Tensor,
         async_op: bool,
-    ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
+    ) -> Tuple[torch.Tensor, Optional[Any]]:
         """Fallback to dense AllReduce."""
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=async_op)
         return tensor, work
@@ -296,7 +296,7 @@ class ChunkedSparseAllReducer(SparseAllReducer):
         mask: Optional[torch.Tensor],
         chunk_id: int,
         async_op: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
+    ) -> Tuple[torch.Tensor, Optional[Any]]:
         """
         Perform chunked sparse AllReduce.
         
@@ -356,7 +356,7 @@ class AdaptiveSparseAllReducer(SparseAllReducer):
         tensor: torch.Tensor,
         mask: Optional[torch.Tensor],
         async_op: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
+    ) -> Tuple[torch.Tensor, Optional[Any]]:
         """
         Adaptively choose sparse or dense AllReduce.
         """

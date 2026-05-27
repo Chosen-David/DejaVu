@@ -289,17 +289,20 @@ class GPUBalancer:
         compute_times = np.zeros(self.num_gpus)
         
         for i, partition in enumerate(partitions):
+            hans_indices = np.asarray(partition.hans_indices, dtype=np.int64)
+            lans_indices = np.asarray(partition.lans_indices, dtype=np.int64)
+
             # HANS compute time (TensorCore)
-            hans_neurons = len(partition.hans_indices)
-            hans_activation_rate = activation_frequencies[partition.hans_indices].mean() if hans_neurons > 0 else 0
+            hans_neurons = len(hans_indices)
+            hans_activation_rate = activation_frequencies[hans_indices].mean() if hans_neurons > 0 else 0
             
             # Dense computation on TensorCore
             hans_flops = 2 * self.hidden_dim * hans_neurons * hans_activation_rate
             hans_time = hans_flops / (self.gpu_compute_tflops * 1e12 * self.tc_efficiency)
             
             # LANS compute time (CUDACore)
-            lans_neurons = len(partition.lans_indices)
-            lans_activation_rate = activation_frequencies[partition.lans_indices].mean() if lans_neurons > 0 else 0
+            lans_neurons = len(lans_indices)
+            lans_activation_rate = activation_frequencies[lans_indices].mean() if lans_neurons > 0 else 0
             
             # Sparse computation on CUDACore
             lans_flops = 2 * self.hidden_dim * lans_neurons * lans_activation_rate

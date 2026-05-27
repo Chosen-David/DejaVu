@@ -26,6 +26,14 @@ class NeuronPartition:
     hans_indices: np.ndarray
     lans_indices: np.ndarray
     coactivated_hans_groups: List[np.ndarray]
+
+    def __post_init__(self):
+        self.hans_indices = np.asarray(self.hans_indices, dtype=np.int64)
+        self.lans_indices = np.asarray(self.lans_indices, dtype=np.int64)
+        self.coactivated_hans_groups = [
+            np.asarray(group, dtype=np.int64)
+            for group in self.coactivated_hans_groups
+        ]
     
     @property
     def total_neurons(self) -> int:

@@ -20,20 +20,20 @@ from dataclasses import dataclass
 import time
 
 # Import solver components
-from ..solver import (
+from solver import (
     CoactivationAnalyzer,
     NeuronPartitioner,
     GPUBalancer,
     TCCCBalancer,
     PipelineScheduler,
 )
-from ..solver.neuron_partitioner import NeuronPartition
+from solver.neuron_partitioner import NeuronPartition
 
 # Import kernel components
-from ..kernels import FlashFFN
+from kernels import FlashFFN
 
 # Import communication components
-from ..communication import create_sparse_communicator, AdaptiveSparseAllReducer
+from communication import create_sparse_communicator, AdaptiveSparseAllReducer
 
 
 @dataclass
@@ -204,13 +204,22 @@ class SparseTPFFN(nn.Module):
         
         # Step 5: Initialize FlashFFN kernel
         print("Step 5: Initializing FlashFFN kernel...")
+        num_tc = len(self.tc_indices)
+        num_cc = len(self.cc_indices)
+        local_tc_indices = torch.arange(num_tc, dtype=torch.long)
+        local_cc_indices = torch.arange(num_tc, num_tc + num_cc, dtype=torch.long)
+
         self.flash_ffn = FlashFFN(
             hidden_dim=self.config.hidden_dim,
-            intermediate_dim=len(self.tc_indices) + len(self.cc_indices),
-            hans_indices=self.tc_indices,
-            lans_indices=self.cc_indices,
+            intermediate_dim=num_tc + num_cc,
+            hans_indices=local_tc_indices,
+            lans_indices=local_cc_indices,
             activation=self.config.activation,
         )
+
+        with torch.no_grad():
+            self.flash_ffn.w1.copy_(self.w1)
+            self.flash_ffn.w2.copy_(self.w2)
         
         elapsed_time = time.time() - start_time
         print(f"Offline analysis completed in {elapsed_time:.2f}s")
@@ -243,7 +252,7 @@ class SparseTPFFN(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        mask: Optional[Any] = None,
     ) -> torch.Tensor:
         """
         Forward pass with sparse optimization.
@@ -280,16 +289,17 @@ class SparseTPFFN(nn.Module):
             
             # Extract chunk
             chunk_x = x[chunk.start_pos:chunk.end_pos]
-            chunk_mask = mask[chunk.start_pos:chunk.end_pos] if mask is not None else None
+            chunk_mask = self._slice_mask_payload(mask, chunk.start_pos, chunk.end_pos)
             
             # Compute using FlashFFN
             chunk_output = self._compute_chunk(chunk_x, chunk_mask)
             
             # Communication (if enabled and distributed)
             if self.communicator is not None and torch.distributed.is_initialized():
+                comm_mask = self._extract_mask_tensor(chunk_mask)
                 chunk_output, _ = self.communicator.adaptive_allreduce(
                     chunk_output,
-                    chunk_mask,
+                    comm_mask,
                     async_op=False,
                 )
             
@@ -310,7 +320,7 @@ class SparseTPFFN(nn.Module):
     def _compute_chunk(
         self,
         x: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: Optional[Any],
     ) -> torch.Tensor:
         """Compute FFN for a chunk."""
         if self.flash_ffn is not None:
@@ -318,6 +328,132 @@ class SparseTPFFN(nn.Module):
         else:
             # Fallback to standard computation
             return self._standard_forward(x)
+
+    @staticmethod
+    def _extract_mask_tensor(mask_payload: Optional[Any]) -> Optional[torch.Tensor]:
+        if isinstance(mask_payload, dict):
+            mask = mask_payload.get('mask')
+            if mask is None:
+                mask = mask_payload.get('prediction_mask')
+            if mask is None:
+                mask = mask_payload.get('activation_mask')
+            return mask
+        if isinstance(mask_payload, (tuple, list)):
+            return mask_payload[0] if len(mask_payload) > 0 else None
+        return mask_payload
+
+    @classmethod
+    def _slice_mask_payload(
+        cls,
+        mask_payload: Optional[Any],
+        start_pos: int,
+        end_pos: int,
+    ) -> Optional[Any]:
+        if mask_payload is None:
+            return None
+        if isinstance(mask_payload, dict):
+            sliced = dict(mask_payload)
+            mask = cls._extract_mask_tensor(mask_payload)
+            if mask is not None:
+                sliced['mask'] = mask[start_pos:end_pos]
+            if mask_payload.get('active_lans_by_tile') is not None:
+                local_plan = []
+                for tile_start, tile_end, active in mask_payload['active_lans_by_tile']:
+                    overlap_start = max(start_pos, int(tile_start))
+                    overlap_end = min(end_pos, int(tile_end))
+                    if overlap_start < overlap_end:
+                        local_plan.append((
+                            overlap_start - start_pos,
+                            overlap_end - start_pos,
+                            active,
+                        ))
+                sliced['active_lans_by_tile'] = local_plan
+            return sliced
+        if isinstance(mask_payload, (tuple, list)):
+            if len(mask_payload) == 0:
+                return None
+            sliced_mask = mask_payload[0][start_pos:end_pos] if mask_payload[0] is not None else None
+            if len(mask_payload) == 1:
+                return (sliced_mask,)
+            return (sliced_mask, *mask_payload[1:])
+        return mask_payload[start_pos:end_pos]
+
+    @staticmethod
+    def build_lans_active_tile_plan(
+        mask: torch.Tensor,
+        num_hans: int,
+        cc_token_tile: int = 1,
+    ) -> List[Tuple[int, int, torch.Tensor]]:
+        """
+        Pre-traverse a predicted activation mask and build per-CC-tile LANS
+        active index lists.
+
+        The returned indices are local to the LANS region, i.e. index 0 means
+        neuron `num_hans` in the full reordered FFN intermediate dimension.
+        """
+        if mask is None:
+            return []
+        if mask.dim() != 2:
+            raise ValueError(f"Expected 2D mask, got shape {tuple(mask.shape)}")
+
+        seq_len = mask.shape[0]
+        num_hans = max(0, min(int(num_hans), mask.shape[1]))
+        lans_mask = mask[:, num_hans:]
+        plan = []
+        tile = max(1, int(cc_token_tile))
+
+        # Fast path for the common CC tile size of one token: one global
+        # nonzero plus offset slicing, avoiding one CUDA synchronization per
+        # token.
+        if tile == 1:
+            rows, cols = torch.nonzero(lans_mask, as_tuple=True)
+            counts = torch.bincount(rows, minlength=seq_len).detach().cpu().numpy()
+            offsets = np.concatenate(([0], np.cumsum(counts)))
+            for token in range(seq_len):
+                start_offset = int(offsets[token])
+                end_offset = int(offsets[token + 1])
+                plan.append((token, token + 1, cols[start_offset:end_offset]))
+            return plan
+
+        rows, cols = torch.nonzero(lans_mask, as_tuple=True)
+        for start in range(0, seq_len, tile):
+            end = min(seq_len, start + tile)
+            in_tile = (rows >= start) & (rows < end)
+            active = torch.unique(cols[in_tile], sorted=True)
+            plan.append((start, end, active))
+        return plan
+
+    def build_runtime_tc_cc_schedule(
+        self,
+        mask: torch.Tensor,
+        num_hans: Optional[int] = None,
+        cc_token_tile: int = 1,
+    ):
+        """
+        Pre-traverse the predicted mask and build the runtime asymmetric
+        TC/CC token schedule used by experiments.
+        """
+        if num_hans is None:
+            if self.flash_ffn is not None:
+                num_hans = self.flash_ffn.num_hans
+            elif self.tc_indices is not None:
+                num_hans = len(self.tc_indices)
+            else:
+                num_hans = self.config.intermediate_dim
+
+        plan = self.build_lans_active_tile_plan(
+            mask=mask,
+            num_hans=num_hans,
+            cc_token_tile=cc_token_tile,
+        )
+        schedule = self.tc_cc_balancer.build_tc_cc_tile_schedule(
+            active_lans_by_tile=plan,
+            num_hans=num_hans,
+        )
+        return {
+            'active_lans_by_tile': plan,
+            'tc_cc_schedule': schedule,
+        }
     
     def _standard_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard FFN forward pass (fallback)."""

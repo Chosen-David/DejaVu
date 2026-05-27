@@ -8,7 +8,7 @@ that integrates with the existing DejaVu architecture.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 import numpy as np
 import os
 
@@ -180,7 +180,16 @@ class ParallelSparseTPMLP(nn.Module):
                 layer_id=self.layer_idx,
             )
             
-            if cached_result is not None:
+            cache_matches = (
+                cached_result is not None
+                and cached_result.hidden_dim == self.hidden_dim
+                and cached_result.intermediate_dim == self.intermediate_dim
+                and cached_result.num_gpus == self.world_size
+                and len(cached_result.partition_results) > self.rank
+                and len(cached_result.tc_cc_assignments) > self.rank
+            )
+
+            if cache_matches:
                 print(f"[Layer {self.layer_idx}] Loading cached analysis results")
                 self._load_from_result(cached_result)
                 return {'status': 'loaded', 'layer_id': self.layer_idx}
@@ -301,6 +310,11 @@ class ParallelSparseTPMLP(nn.Module):
         
         # Combine TC and CC indices
         new_order = torch.cat([self.tc_indices, self.cc_indices])
+        if len(new_order) == 0 or new_order.max().item() >= self.intermediate_dim_per_gpu:
+            # Partitions are expressed in global neuron ids while fc1/fc2 are
+            # already local TP shards. Keep the local shard order for smoke
+            # experiments unless a local index mapping is available.
+            return
         
         # Reorder fc1 columns
         self.fc1.data = self.fc1.data[:, new_order[:self.intermediate_dim_per_gpu]]
@@ -313,27 +327,33 @@ class ParallelSparseTPMLP(nn.Module):
         if self.tc_indices is None:
             return
         
-        num_tc = min(len(self.tc_indices), self.intermediate_dim_per_gpu)
-        num_cc = min(len(self.cc_indices), self.intermediate_dim_per_gpu)
+        local_intermediate_dim = self.fc1.shape[1]
+        num_tc = min(len(self.tc_indices), local_intermediate_dim)
+        num_cc = max(0, local_intermediate_dim - num_tc)
         
         if num_tc == 0 and num_cc == 0:
-            return
+            num_tc = local_intermediate_dim
         
-        tc_idx = self.tc_indices[:num_tc] if num_tc > 0 else torch.tensor([], dtype=torch.long)
-        cc_idx = self.cc_indices[:num_cc] if num_cc > 0 else torch.tensor([], dtype=torch.long)
+        device = self.fc1.device
+        local_tc_idx = torch.arange(num_tc, dtype=torch.long, device=device)
+        local_cc_idx = torch.arange(num_tc, num_tc + num_cc, dtype=torch.long, device=device)
         
         self.flash_ffn = FlashFFN(
             hidden_dim=self.hidden_dim,
             intermediate_dim=num_tc + num_cc,
-            hans_indices=tc_idx,
-            lans_indices=cc_idx,
+            hans_indices=local_tc_idx,
+            lans_indices=local_cc_idx,
             activation=self.activation,
-        )
+        ).to(device=device, dtype=self.fc1.dtype)
+
+        with torch.no_grad():
+            self.flash_ffn.w1.copy_(self.fc1[:, :num_tc + num_cc])
+            self.flash_ffn.w2.copy_(self.fc2[:num_tc + num_cc, :])
     
     def forward(
         self,
         x: torch.Tensor,
-        predictor_output: Optional[torch.Tensor] = None,
+        predictor_output: Optional[Any] = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -353,6 +373,25 @@ class ParallelSparseTPMLP(nn.Module):
         else:
             seq_len = input_shape[0]
         
+        active_lans_indices = None
+        active_lans_by_tile = None
+        if isinstance(predictor_output, dict):
+            active_lans_indices = predictor_output.get('active_lans_indices')
+            active_lans_by_tile = predictor_output.get('active_lans_by_tile')
+            predictor_payload = predictor_output.get('mask')
+            if predictor_payload is None:
+                predictor_payload = predictor_output.get('prediction_mask')
+            if predictor_payload is None:
+                predictor_payload = predictor_output.get('activation_mask')
+            predictor_output = predictor_payload
+        elif isinstance(predictor_output, (tuple, list)):
+            if len(predictor_output) == 0:
+                predictor_output = None
+            else:
+                active_lans_indices = predictor_output[1] if len(predictor_output) > 1 else None
+                active_lans_by_tile = predictor_output[2] if len(predictor_output) > 2 else None
+                predictor_output = predictor_output[0]
+
         # Get mask from predictor
         if predictor_output is not None:
             # predictor_output shape: [batch, seq, intermediate_per_gpu] or [seq, intermediate_per_gpu]
@@ -361,15 +400,28 @@ class ParallelSparseTPMLP(nn.Module):
             
             # Convert logits to mask if needed
             if predictor_output.dtype in [torch.float16, torch.float32]:
-                mask = (torch.sigmoid(predictor_output) > 0.5).float()
+                if predictor_output.min() >= 0 and predictor_output.max() <= 1:
+                    mask = predictor_output.float()
+                else:
+                    mask = (torch.sigmoid(predictor_output) > 0.5).float()
             else:
                 mask = predictor_output.float()
         else:
             mask = None
+
+        if active_lans_by_tile is not None:
+            mask_payload = {
+                'mask': mask,
+                'active_lans_by_tile': active_lans_by_tile,
+            }
+        elif active_lans_indices is not None:
+            mask_payload = (mask, active_lans_indices)
+        else:
+            mask_payload = mask
         
         # Compute
         if self.flash_ffn is not None and self.is_analyzed:
-            output = self.flash_ffn(x, mask)
+            output = self.flash_ffn(x, mask_payload)
         else:
             # Fallback to standard computation
             output = self._standard_forward(x)
@@ -382,7 +434,9 @@ class ParallelSparseTPMLP(nn.Module):
     
     def _standard_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard FFN forward pass."""
-        intermediate = F.linear(x, self.fc1.t())
+        fc1 = self.fc1.to(dtype=x.dtype)
+        fc2 = self.fc2.to(dtype=x.dtype)
+        intermediate = F.linear(x, fc1.t())
         
         if self.activation == "gelu":
             intermediate = F.gelu(intermediate)
@@ -391,7 +445,7 @@ class ParallelSparseTPMLP(nn.Module):
         elif self.activation == "silu":
             intermediate = F.silu(intermediate)
         
-        output = F.linear(intermediate, self.fc2.t())
+        output = F.linear(intermediate, fc2.t())
         return output
 
 

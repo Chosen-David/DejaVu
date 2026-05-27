@@ -45,6 +45,89 @@ class TCCCAssignment:
         return max(self.tc_time, self.cc_time)
 
 
+@dataclass
+class TCCCTileScheduleEntry:
+    """Runtime TC/CC tile balance decision for one LANS tile."""
+    cc_start: int
+    cc_end: int
+    active_lans: int
+    tc_token_tile: int
+    tc_hans: int
+    estimated_tc_ms: float
+    estimated_cc_ms: float
+    overlap_efficiency: float
+
+
+@dataclass
+class TCCCTileSchedule:
+    """Runtime TC/CC tile balance schedule built from a predicted mask plan."""
+    entries: List[TCCCTileScheduleEntry]
+    mean_active_lans: float
+    max_active_lans: int
+    mean_tc_token_tile: float
+    mean_overlap_efficiency: float
+
+
+@dataclass
+class TCCCProfilePoint:
+    """Measured TC/CC timing point used by the runtime tile scheduler."""
+    cc_tokens: int
+    active_lans: int
+    cc_ms: float
+    tc_tokens: int
+    tc_hans: int
+    tc_ms: float
+
+
+class TCCCProfile:
+    """
+    Hardware profile for asymmetric TC/CC token scheduling.
+
+    The default values are measured on the local A6000 with fp16,
+    hidden=4096, intermediate=16384. They capture the key design point:
+    CC processes tiny LANS token tiles while TC processes larger HANS token
+    tiles to finish at approximately the same time.
+    """
+
+    def __init__(self, points: Optional[List[TCCCProfilePoint]] = None):
+        self.points = points or [
+            TCCCProfilePoint(1, 1, 0.3817, 512, 2048, 0.4069),
+            TCCCProfilePoint(1, 2, 0.5369, 16, 16384, 0.5395),
+            TCCCProfilePoint(1, 4, 0.5049, 512, 4096, 0.4881),
+            TCCCProfilePoint(1, 8, 0.6027, 128, 16384, 0.6032),
+            TCCCProfilePoint(1, 16, 0.6623, 64, 16384, 0.6446),
+            TCCCProfilePoint(2, 8, 0.5038, 16, 16384, 0.5030),
+            TCCCProfilePoint(4, 8, 0.6957, 256, 8192, 0.6326),
+        ]
+
+    def lookup(self, cc_tokens: int, active_lans: int, max_hans: int) -> TCCCProfilePoint:
+        cc_tokens = max(1, int(cc_tokens))
+        active_lans = max(1, int(active_lans))
+        max_hans = max(1, int(max_hans))
+
+        def score(point: TCCCProfilePoint) -> Tuple[int, int, float]:
+            return (
+                abs(point.active_lans - active_lans),
+                abs(point.cc_tokens - cc_tokens),
+                abs(point.tc_ms - point.cc_ms),
+            )
+
+        selected = min(self.points, key=score)
+        if selected.tc_hans <= max_hans:
+            return selected
+
+        tc_hans = max_hans
+        token_scale = selected.tc_hans / max(1, tc_hans)
+        return TCCCProfilePoint(
+            selected.cc_tokens,
+            selected.active_lans,
+            selected.cc_ms,
+            max(1, int(np.ceil(selected.tc_tokens * token_scale))),
+            tc_hans,
+            selected.tc_ms,
+        )
+
+
 class TCCCBalancer:
     """
     Balances neuron execution between TensorCore and CUDACore.
@@ -96,6 +179,7 @@ class TCCCBalancer:
         self.tc_tile_k = 16
         self.cc_tile_m = 32  # CUDACore tile size
         self.cc_tile_n = 32
+        self.runtime_profile = TCCCProfile()
     
     def balance(
         self,
@@ -118,6 +202,10 @@ class TCCCBalancer:
         Returns:
             TCCCAssignment with optimal TC/CC split
         """
+        hans_indices = np.asarray(hans_indices, dtype=np.int64)
+        lans_indices = np.asarray(lans_indices, dtype=np.int64)
+        activation_frequencies = np.asarray(activation_frequencies)
+
         if search_method == 'heuristic':
             return self._heuristic_balance(
                 hans_indices, lans_indices, activation_frequencies, sequence_length
@@ -170,8 +258,8 @@ class TCCCBalancer:
                 move_count = max(1, len(tc_indices) // 20)
                 move_indices = [idx for idx, _ in hans_freqs[:move_count]]
                 
-                tc_indices = np.array([idx for idx in tc_indices if idx not in move_indices])
-                cc_indices = np.append(cc_indices, move_indices)
+                tc_indices = np.array([idx for idx in tc_indices if idx not in move_indices], dtype=np.int64)
+                cc_indices = np.append(cc_indices, move_indices).astype(np.int64)
             else:
                 # CC takes longer, move some neurons to TC
                 if len(cc_indices) == 0:
@@ -184,8 +272,8 @@ class TCCCBalancer:
                 move_count = max(1, len(cc_indices) // 20)
                 move_indices = [idx for idx, _ in lans_freqs[:move_count]]
                 
-                cc_indices = np.array([idx for idx in cc_indices if idx not in move_indices])
-                tc_indices = np.append(tc_indices, move_indices)
+                cc_indices = np.array([idx for idx in cc_indices if idx not in move_indices], dtype=np.int64)
+                tc_indices = np.append(tc_indices, move_indices).astype(np.int64)
             
             # Recalculate times
             tc_time = self._estimate_tc_time(tc_indices, activation_frequencies, sequence_length)
@@ -194,8 +282,8 @@ class TCCCBalancer:
         overlap_efficiency = self._calculate_overlap_efficiency(tc_time, cc_time)
         
         return TCCCAssignment(
-            tc_indices=np.sort(tc_indices),
-            cc_indices=np.sort(cc_indices),
+            tc_indices=np.sort(tc_indices).astype(np.int64),
+            cc_indices=np.sort(cc_indices).astype(np.int64),
             tc_time=tc_time,
             cc_time=cc_time,
             overlap_efficiency=overlap_efficiency
@@ -451,3 +539,55 @@ class TCCCBalancer:
                 'tile_n': self.cc_tile_n,
             }
         }
+
+    def build_tc_cc_tile_schedule(
+        self,
+        active_lans_by_tile: List[Tuple[int, int, torch.Tensor]],
+        num_hans: int,
+        profile: Optional[TCCCProfile] = None,
+    ) -> TCCCTileSchedule:
+        """
+        Build an asymmetric runtime TC/CC token schedule from a pre-traversed
+        predicted mask plan.
+
+        Each input tile represents a small CC LANS token tile. The scheduler
+        looks up a measured balance point and recommends how many HANS tokens
+        TC should process while CC handles that LANS tile.
+        """
+        profile = profile or self.runtime_profile
+        entries: List[TCCCTileScheduleEntry] = []
+
+        for start, end, active in active_lans_by_tile:
+            active_count = int(active.numel() if hasattr(active, "numel") else len(active))
+            if active_count == 0:
+                continue
+            cc_tokens = max(1, int(end) - int(start))
+            point = profile.lookup(cc_tokens, active_count, max_hans=num_hans)
+            overlap = self._calculate_overlap_efficiency(point.tc_ms, point.cc_ms)
+            entries.append(TCCCTileScheduleEntry(
+                cc_start=int(start),
+                cc_end=int(end),
+                active_lans=active_count,
+                tc_token_tile=point.tc_tokens,
+                tc_hans=point.tc_hans,
+                estimated_tc_ms=point.tc_ms,
+                estimated_cc_ms=point.cc_ms,
+                overlap_efficiency=overlap,
+            ))
+
+        if not entries:
+            return TCCCTileSchedule(
+                entries=[],
+                mean_active_lans=0.0,
+                max_active_lans=0,
+                mean_tc_token_tile=0.0,
+                mean_overlap_efficiency=1.0,
+            )
+
+        return TCCCTileSchedule(
+            entries=entries,
+            mean_active_lans=float(np.mean([e.active_lans for e in entries])),
+            max_active_lans=int(max(e.active_lans for e in entries)),
+            mean_tc_token_tile=float(np.mean([e.tc_token_tile for e in entries])),
+            mean_overlap_efficiency=float(np.mean([e.overlap_efficiency for e in entries])),
+        )
